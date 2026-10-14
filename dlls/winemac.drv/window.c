@@ -35,6 +35,7 @@
 #undef LoadResource
 
 #include "macdrv.h"
+#include "wine/macdrv_metal.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
@@ -1088,6 +1089,7 @@ static void macdrv_client_surface_detach(struct client_surface *client)
     if (surface->cocoa_view)
     {
         struct macdrv_win_data *data;
+        macdrv_view view = surface->cocoa_view;
 
         if ((data = get_win_data(client->hwnd)))
         {
@@ -1096,7 +1098,12 @@ static void macdrv_client_surface_detach(struct client_surface *client)
             release_win_data(data);
         }
 
-        macdrv_dispose_view(surface->cocoa_view);
+        if (surface->dispose_view_async)
+        {
+            surface->cocoa_view = NULL;
+            macdrv_dispose_view_async(view);
+        }
+        else macdrv_dispose_view(view);
     }
 }
 
@@ -1149,17 +1156,116 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
 {
     struct macdrv_client_surface *surface;
 
-    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format);
-    surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
-    macdrv_set_view_hidden(surface->cocoa_view, TRUE);
-
-    if (surface)
+    if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format)))
+        return NULL;
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
     {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
+        client_surface_release(&surface->client);
+        return NULL;
     }
+    macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0);
 
     return &surface->client;
+}
+
+struct macdrv_metal_surface_data
+{
+    struct client_surface *client;
+    macdrv_metal_view metal_view;
+    macdrv_metal_layer metal_layer;
+};
+
+struct macdrv_create_metal_surface_request
+{
+    void *metal_device;
+    macdrv_metal_surface result;
+};
+
+static DWORD get_metal_surface_window_thread(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+    DWORD thread, process = 0;
+    BOOL native_window;
+
+    if (!hwnd || !(thread = NtUserGetWindowThread(hwnd, &process)) || process != GetCurrentProcessId())
+        return 0;
+    if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CHILD) || NtUserGetAncestor(hwnd, GA_ROOT) != hwnd)
+        return 0;
+    if (!(data = get_win_data(hwnd))) return 0;
+    native_window = data->cocoa_window != NULL;
+    release_win_data(data);
+    return native_window ? thread : 0;
+}
+
+static macdrv_metal_surface create_metal_surface_on_owner(HWND hwnd, void *device)
+{
+    struct macdrv_client_surface *surface;
+    macdrv_metal_surface lease;
+
+    if (!device || pthread_main_np() || get_metal_surface_window_thread(hwnd) != GetCurrentThreadId())
+        return NULL;
+    if (!(lease = calloc(1, sizeof(*lease)))) return NULL;
+    if (!(lease->client = macdrv_CreateClientSurface(hwnd, 0))) goto failed;
+    surface = impl_from_client_surface(lease->client);
+    surface->dispose_view_async = TRUE;
+
+    /* View allocation pumps queries and may reenter HWND destruction. Register
+     * only after rechecking, before the next synchronous AppKit operation.
+     */
+    if (get_metal_surface_window_thread(hwnd) != GetCurrentThreadId()) goto failed;
+    use_window_client_surface(lease->client, TRUE);
+
+    lease->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, (macdrv_metal_device)device);
+    if (!lease->metal_view || !is_client_surface_window(lease->client, hwnd)) goto failed;
+    lease->metal_layer = macdrv_view_get_metal_layer(lease->metal_view);
+    if (!lease->metal_layer || !is_client_surface_window(lease->client, hwnd)) goto failed;
+    return lease;
+
+failed:
+    macdrv_metal_surface_release_v1(lease);
+    return NULL;
+}
+
+__attribute__((visibility("default")))
+macdrv_metal_surface macdrv_metal_surface_create_v1(uint32_t hwnd32, void *device, void **layer)
+{
+    struct macdrv_create_metal_surface_request request = { .metal_device = device };
+    HWND hwnd = (HWND)(ULONG_PTR)hwnd32;
+    DWORD thread;
+
+    if (!layer) return NULL;
+    *layer = NULL;
+    if (!device || pthread_main_np() || !(thread = get_metal_surface_window_thread(hwnd))) return NULL;
+    if (thread == GetCurrentThreadId()) request.result = create_metal_surface_on_owner(hwnd, device);
+    else
+    {
+        /* Native high-bit driver messages are handled before PE/WOW64 window
+         * procedure packing. This same-process stack request stays native and
+         * remains live until the synchronous send returns.
+         */
+        send_message(hwnd, WM_MACDRV_CREATE_METAL_SURFACE, 0, (LPARAM)&request);
+    }
+    if (request.result) *layer = request.result->metal_layer;
+    return request.result;
+}
+
+__attribute__((visibility("default")))
+int macdrv_metal_surface_prepare_v1(macdrv_metal_surface surface)
+{
+    if (!surface) return 0;
+    client_surface_present(surface->client);
+    return is_client_surface_window(surface->client, NULL);
+}
+
+__attribute__((visibility("default")))
+void macdrv_metal_surface_release_v1(macdrv_metal_surface surface)
+{
+    if (!surface) return;
+    if (surface->metal_view) macdrv_view_release_metal_view(surface->metal_view);
+    if (surface->client) client_surface_release(surface->client);
+    free(surface);
 }
 
 BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface)
@@ -1568,6 +1674,13 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
             if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
             release_win_data(data);
+        }
+        return 0;
+    case WM_MACDRV_CREATE_METAL_SURFACE:
+        if (lp)
+        {
+            struct macdrv_create_metal_surface_request *request = (void *)lp;
+            request->result = create_metal_surface_on_owner(hwnd, request->metal_device);
         }
         return 0;
     }

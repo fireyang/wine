@@ -98,6 +98,7 @@ enum macdrv_window_messages
     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
     WM_MACDRV_CREATE_REMOTE_LAYER,
     WM_MACDRV_RELEASE_REMOTE_LAYER,
+    WM_MACDRV_CREATE_METAL_SURFACE,
 };
 
 struct macdrv_thread_data
@@ -199,6 +200,7 @@ struct macdrv_client_surface
     struct client_surface   client;
     macdrv_view             cocoa_view;
     macdrv_metal_swapchain  metal_swapchain;
+    BOOL                    dispose_view_async;
 };
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);

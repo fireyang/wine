@@ -518,6 +518,7 @@ extern void macdrv_give_cocoa_window_focus(macdrv_window w, bool activate);
 extern void macdrv_set_window_min_max_sizes(macdrv_window w, CGSize min_size, CGSize max_size);
 extern macdrv_view macdrv_create_view(CGRect rect);
 extern void macdrv_dispose_view(macdrv_view v);
+extern void macdrv_dispose_view_async(macdrv_view v);
 extern void macdrv_set_view_frame(macdrv_view v, CGRect rect);
 extern void macdrv_set_view_superview(macdrv_view v, macdrv_view s, macdrv_window w, macdrv_view p, macdrv_view n);
 extern void macdrv_set_view_hidden(macdrv_view v, bool hidden);

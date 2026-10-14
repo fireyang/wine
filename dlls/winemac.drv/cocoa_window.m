@@ -29,6 +29,7 @@
 #import "cocoa_window.h"
 
 #include "macdrv_cocoa.h"
+#include "wine/macdrv_metal.h"
 #import "cocoa_app.h"
 #import "cocoa_event.h"
 #import "cocoa_opengl.h"
@@ -712,6 +713,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (_metalView) return _metalView;
 
         WineMetalView* view = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
+        if (!view) return nil;
         [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [self setAutoresizesSubviews:YES];
         [self addSubview:view positioned:NSWindowBelow relativeTo:nil];
@@ -3789,6 +3791,7 @@ macdrv_view macdrv_create_view(CGRect rect)
         NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
 
         view = [[WineContentView alloc] initWithFrame:NSRectFromCGRect(cgrect_mac_from_win(rect))];
+        if (!view) return;
         [view setAutoresizingMask:NSViewNotSizable];
         [view setHidden:YES];
 #pragma clang diagnostic push
@@ -3814,6 +3817,25 @@ macdrv_view macdrv_create_view(CGRect rect)
  *
  * Destroys a view previously returned by macdrv_create_view.
  */
+static void dispose_view(WineContentView* view)
+{
+    NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+    WineWindow* window = (WineWindow*)[view window];
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [nc removeObserver:view
+                  name:NSViewGlobalFrameDidChangeNotification
+                object:view];
+#pragma clang diagnostic pop
+    [nc removeObserver:view
+                  name:WineDisplayConfigurationChangedNotification
+                object:NSApp];
+    [view removeFromSuperview];
+    [view release];
+    [window updateForGLSubviews];
+}
+
 void macdrv_dispose_view(macdrv_view v)
 {
 @autoreleasepool
@@ -3821,21 +3843,23 @@ void macdrv_dispose_view(macdrv_view v)
     WineContentView* view = (WineContentView*)v;
 
     OnMainThread(^{
-        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
-        WineWindow* window = (WineWindow*)[view window];
+        dispose_view(view);
+    });
+}
+}
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [nc removeObserver:view
-                      name:NSViewGlobalFrameDidChangeNotification
-                    object:view];
-#pragma clang diagnostic pop
-        [nc removeObserver:view
-                      name:WineDisplayConfigurationChangedNotification
-                    object:NSApp];
-        [view removeFromSuperview];
-        [view release];
-        [window updateForGLSubviews];
+/* Used by bridge client surfaces whose detach callback runs with the win32u
+ * surface lock held. Copying the block retains this typed view independently
+ * of the client surface; dispose_view consumes its allocation reference.
+ */
+void macdrv_dispose_view_async(macdrv_view v)
+{
+@autoreleasepool
+{
+    WineContentView* view = (WineContentView*)v;
+
+    OnMainThreadAsync(^{
+        dispose_view(view);
     });
 }
 }
@@ -3972,6 +3996,17 @@ void macdrv_remove_view_opengl_context(macdrv_view v, macdrv_opengl_context c)
     OnMainThreadAsync(^{
         [view removeGLContext:context];
     });
+}
+}
+
+__attribute__((visibility("default")))
+void macdrv_metal_run_on_main_v1(macdrv_metal_main_callback callback, void *context)
+{
+@autoreleasepool
+{
+    if (!callback) return;
+    if ([NSThread isMainThread]) callback(context);
+    else OnMainThread(^{ callback(context); });
 }
 }
 
