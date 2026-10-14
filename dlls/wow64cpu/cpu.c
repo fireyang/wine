@@ -39,10 +39,33 @@ struct thunk_32to64
     DWORD addr;
     WORD  cs;
 };
+struct thunk_32to64_rosetta
+{
+    BYTE lcall;
+    BYTE modrm;
+    DWORD op;
+    DWORD addr;
+    WORD cs;
+    BYTE add;
+    BYTE add_modrm;
+    BYTE add_op;
+    BYTE jmp;
+    BYTE jmp_modrm;
+    DWORD jmp_op;
+    ULONG64 jmp_addr;
+};
 struct thunk_opcodes
 {
-    struct thunk_32to64 syscall_thunk;
-    struct thunk_32to64 unix_thunk;
+    union
+    {
+        struct thunk_32to64 syscall_thunk;
+        struct thunk_32to64_rosetta syscall_thunk_rosetta;
+    };
+    union
+    {
+        struct thunk_32to64 unix_thunk;
+        struct thunk_32to64_rosetta unix_thunk_rosetta;
+    };
 };
 #pragma pack(pop)
 
@@ -50,6 +73,8 @@ static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
 
 UINT cs32_sel = 0;
 UINT ss32_sel = 0;
+/* CodeWeavers CW20760: far calls and returns avoid a Rosetta SIGUSR1 mode-switch race. */
+BOOL use_rosetta2_workaround;
 
 static USHORT cs64_sel;
 static USHORT ds64_sel;
@@ -210,7 +235,16 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
+                   "cmpb $0,use_rosetta2_workaround(%rip)\n\t"
+                   "jne .Lsyscall_rosetta_return\n\t"
                    "ljmp *(%r14)\n"
+                   ".Lsyscall_rosetta_return:\n\t"
+                   "subq $0x10,%rsp\n\t"
+                   "movl 4(%r14),%edx\n\t"
+                   "movq %rdx,0x8(%rsp)\n\t"
+                   "movl (%r14),%edx\n\t"
+                   "movq %rdx,(%rsp)\n\t"
+                   "lretq\n"
                    ".Lsyscall_32to64_return:\n\t"
                    "movq %rsp,%r14\n\t"
                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
@@ -270,7 +304,16 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
                    "movl %edx,4(%rsp)\n\t"
                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
                    "xchgq %r14,%rsp\n\t"
-                   "ljmp *(%r14)" )
+                   "cmpb $0,use_rosetta2_workaround(%rip)\n\t"
+                   "jne .Lunix_rosetta_return\n\t"
+                   "ljmp *(%r14)\n"
+                   ".Lunix_rosetta_return:\n\t"
+                   "subq $0x10,%rsp\n\t"
+                   "movl 4(%r14),%edx\n\t"
+                   "movq %rdx,0x8(%rsp)\n\t"
+                   "movl (%r14),%edx\n\t"
+                   "movq %rdx,(%rsp)\n\t"
+                   "lretq" )
 
 
 /**********************************************************************
@@ -311,6 +354,7 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     HMODULE module;
     UNICODE_STRING str = RTL_CONSTANT_STRING( L"ntdll.dll" );
     void **p__wine_unix_call_dispatcher;
+    char processor_brand[128] = {0};
     WOW64INFO *wow64info = NtCurrentTeb()->TlsSlots[WOW64_TLS_WOW64INFO];
 
     if ((ULONG_PTR)syscall_32to64 >> 32)
@@ -335,17 +379,53 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     cs32_sel = context_i386.SegCs;
     ss32_sel = context_i386.SegSs;
 
-    thunk->syscall_thunk.ljmp  = 0xff;
-    thunk->syscall_thunk.modrm = 0x2d;
-    thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
-    thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
-    thunk->syscall_thunk.cs    = cs64_sel;
+    use_rosetta2_workaround = !NtQuerySystemInformation( SystemProcessorBrandString, processor_brand,
+                                                        sizeof(processor_brand), NULL )
+                             && strstr( processor_brand, "VirtualApple" );
+    TRACE( "Rosetta far-call workaround enabled: %u\n", use_rosetta2_workaround );
 
-    thunk->unix_thunk.ljmp  = 0xff;
-    thunk->unix_thunk.modrm = 0x2d;
-    thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
-    thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
-    thunk->unix_thunk.cs    = cs64_sel;
+    if (use_rosetta2_workaround)
+    {
+        thunk->syscall_thunk_rosetta.lcall = 0xff;
+        thunk->syscall_thunk_rosetta.modrm = 0x1d;
+        thunk->syscall_thunk_rosetta.op = PtrToUlong( &thunk->syscall_thunk_rosetta.addr );
+        thunk->syscall_thunk_rosetta.addr = PtrToUlong( &thunk->syscall_thunk_rosetta.add );
+        thunk->syscall_thunk_rosetta.cs = cs64_sel;
+        thunk->syscall_thunk_rosetta.add = 0x83;
+        thunk->syscall_thunk_rosetta.add_modrm = 0xc4;
+        thunk->syscall_thunk_rosetta.add_op = 0x08;
+        thunk->syscall_thunk_rosetta.jmp = 0xff;
+        thunk->syscall_thunk_rosetta.jmp_modrm = 0x25;
+        thunk->syscall_thunk_rosetta.jmp_op = 0;
+        thunk->syscall_thunk_rosetta.jmp_addr = PtrToUlong( syscall_32to64 );
+
+        thunk->unix_thunk_rosetta.lcall = 0xff;
+        thunk->unix_thunk_rosetta.modrm = 0x1d;
+        thunk->unix_thunk_rosetta.op = PtrToUlong( &thunk->unix_thunk_rosetta.addr );
+        thunk->unix_thunk_rosetta.addr = PtrToUlong( &thunk->unix_thunk_rosetta.add );
+        thunk->unix_thunk_rosetta.cs = cs64_sel;
+        thunk->unix_thunk_rosetta.add = 0x83;
+        thunk->unix_thunk_rosetta.add_modrm = 0xc4;
+        thunk->unix_thunk_rosetta.add_op = 0x08;
+        thunk->unix_thunk_rosetta.jmp = 0xff;
+        thunk->unix_thunk_rosetta.jmp_modrm = 0x25;
+        thunk->unix_thunk_rosetta.jmp_op = 0;
+        thunk->unix_thunk_rosetta.jmp_addr = PtrToUlong( unix_call_32to64 );
+    }
+    else
+    {
+        thunk->syscall_thunk.ljmp  = 0xff;
+        thunk->syscall_thunk.modrm = 0x2d;
+        thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
+        thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
+        thunk->syscall_thunk.cs    = cs64_sel;
+
+        thunk->unix_thunk.ljmp  = 0xff;
+        thunk->unix_thunk.modrm = 0x2d;
+        thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
+        thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
+        thunk->unix_thunk.cs    = cs64_sel;
+    }
 
     NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
     return STATUS_SUCCESS;
